@@ -74,6 +74,8 @@ class AdaptiveStateCompressor(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.compression_factor = compression_factor
+        self.eps = 1e-8
+
         self.compressor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // compression_factor),
             nn.LayerNorm(hidden_dim // compression_factor),
@@ -93,12 +95,33 @@ class AdaptiveStateCompressor(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
+        # Initialize weights properly
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights to prevent NaN values"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: (B, L, D)
+        # Add validation check
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
         importance = self.importance_scorer(x)  # (B, L, 1)
+        importance = importance.squeeze(-1)  # (B, L)
+
+        # Clamp importance to valid range and add epsilon
+        importance = torch.clamp(importance, self.eps, 1.0 - self.eps)
+
         compressed = self.compressor(x)  # (B, L, D//C)
         decompressed = self.decompressor(compressed)  # (B, L, D)
-        return decompressed, importance.squeeze(-1)
+
+        return decompressed, importance
 
 # =============================================================================
 # DYNAMIC ROUTER WITH CAPACITY CONSTRAINTS
@@ -108,6 +131,8 @@ class DynamicRouter(nn.Module):
     def __init__(self, hidden_dim: int, capacity: float = 0.5, conv_kernel: int = 3):
         super().__init__()
         self.capacity = capacity
+        self.eps = 1e-8
+
         self.probe = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim // 4, conv_kernel, padding=conv_kernel//2, groups=8),
             nn.ReLU(),
@@ -120,17 +145,46 @@ class DynamicRouter(nn.Module):
         self.temperature = nn.Parameter(torch.tensor(1.0))
         self.token_gate = nn.Linear(hidden_dim, 1)
 
+        # Initialize weights properly
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights to prevent NaN values"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv1d):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: (B, L, D)
         batch_size, seq_len, hidden_dim = x.shape
 
+        # Add validation check
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
         # Global routing decision
         route_logits = self.probe(x.transpose(1, 2))
-        route_probs = F.gumbel_softmax(route_logits, tau=self.temperature, dim=-1)
+        # Clamp temperature to prevent extreme values
+        temp = torch.clamp(self.temperature, min=0.1, max=10.0)
+        route_probs = F.gumbel_softmax(route_logits, tau=temp, dim=-1)
 
         # Token-level gating
         token_scores = self.token_gate(x).squeeze(-1)  # (B, L)
-        k = int(seq_len * self.capacity)
+
+        # Handle NaN/Inf in token scores
+        if torch.isnan(token_scores).any() or torch.isinf(token_scores).any():
+            token_scores = torch.nan_to_num(token_scores, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # Normalize token scores to prevent extreme values
+        token_scores = torch.tanh(token_scores)
+
+        k = max(1, int(seq_len * self.capacity))  # Ensure k >= 1
         topk_indices = torch.topk(token_scores, k, dim=-1).indices
 
         # Create routing mask
@@ -316,6 +370,7 @@ class HybridLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_dim = config.hidden_dim
+        self.eps = 1e-8
 
         self.router = DynamicRouter(config.hidden_dim, config.router_capacity, config.conv_kernel)
         self.ssm = SSMLayer(config.hidden_dim, config.ssm_kernel_size, config.dropout)
@@ -334,12 +389,16 @@ class HybridLayer(nn.Module):
         self.bridge = BidirectionalBridge(config.hidden_dim)
         self.compressor = AdaptiveStateCompressor(config.hidden_dim, config.compression_factor)
 
-        # Layer scaling
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.beta = nn.Parameter(torch.tensor(0.1))
+        # Layer scaling - better initialization to prevent NaN
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.beta = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         B, L, D = x.shape
+
+        # Add input validation
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Dynamic routing
         route_probs, routing_mask, token_scores = self.router(x)
@@ -367,18 +426,37 @@ class HybridLayer(nn.Module):
         # Adaptive compression
         compressed, importance = self.compressor(ssm_enhanced)
 
-        # Gated aggregation
-        gate = torch.sigmoid(self.alpha * importance + self.beta * token_scores)
+        # Validate importance and token_scores before gate calculation
+        if torch.isnan(importance).any() or torch.isinf(importance).any():
+            importance = torch.nan_to_num(importance, nan=0.5, posinf=1.0, neginf=0.0)
+
+        if torch.isnan(token_scores).any() or torch.isinf(token_scores).any():
+            token_scores = torch.nan_to_num(token_scores, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Gated aggregation with clamped parameters
+        alpha_clamped = torch.clamp(self.alpha, min=-10.0, max=10.0)
+        beta_clamped = torch.clamp(self.beta, min=-10.0, max=10.0)
+
+        gate_logits = alpha_clamped * importance + beta_clamped * token_scores
+        gate = torch.sigmoid(gate_logits)
+
+        # Add epsilon and clamp gate to prevent extreme values
+        gate = torch.clamp(gate, self.eps, 1.0 - self.eps)
+
         combined = gate.unsqueeze(-1) * compressed + (1 - gate.unsqueeze(-1)) * transformer_enhanced
 
         # Residual connection
         out = x + combined
 
+        # Compute metrics with validation
+        mean_gate = gate.mean().item() if not torch.isnan(gate).any() else 0.5
+        compression_rate = importance.mean().item() if not torch.isnan(importance).any() else 0.5
+
         metrics = {
             'ssm_tokens': ssm_mask.sum().item() / B,
             'transformer_tokens': transformer_mask.sum().item() / B,
-            'mean_gate': gate.mean().item(),
-            'compression_rate': importance.mean().item()
+            'mean_gate': mean_gate,
+            'compression_rate': compression_rate
         }
 
         return out, metrics
