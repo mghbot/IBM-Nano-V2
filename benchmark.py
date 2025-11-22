@@ -2,9 +2,20 @@
 Benchmark script to compare DynamicHybridModel with IBM Granite Nano 350M.
 
 Usage:
+    # Fast testing with tiny config
+    python benchmark.py --config tiny
+
+    # Other config presets
+    python benchmark.py --config small
+    python benchmark.py --config medium
+    python benchmark.py --config large
+
+    # Custom parameters
     python benchmark.py --model dynamic --device cuda
     python benchmark.py --model granite --granite-path ~/models/granite-350m/
-    python benchmark.py --compare --granite-path ~/models/granite-350m/
+    python benchmark.py --config tiny --batch-size 4  # Override preset values
+
+Available configs: tiny, small, medium, large
 """
 
 import torch
@@ -17,6 +28,61 @@ import numpy as np
 from collections import defaultdict
 
 from model import DynamicHybridModel, ModelConfig, MemoryTracker
+
+# =============================================================================
+# CONFIG PRESETS
+# =============================================================================
+
+CONFIG_PRESETS = {
+    'tiny': {
+        'hidden_dim': 256,
+        'num_layers': 4,
+        'num_heads': 4,
+        'batch_size': 2,
+        'max_seq_len': 128,
+        'description': 'Tiny config for fast testing'
+    },
+    'small': {
+        'hidden_dim': 384,
+        'num_layers': 6,
+        'num_heads': 6,
+        'batch_size': 4,
+        'max_seq_len': 512,
+        'description': 'Small config for quick experiments'
+    },
+    'medium': {
+        'hidden_dim': 512,
+        'num_layers': 8,
+        'num_heads': 8,
+        'batch_size': 8,
+        'max_seq_len': 1024,
+        'description': 'Medium config for standard benchmarking'
+    },
+    'large': {
+        'hidden_dim': 768,
+        'num_layers': 12,
+        'num_heads': 12,
+        'batch_size': 16,
+        'max_seq_len': 2048,
+        'description': 'Large config (default model size)'
+    }
+}
+
+def apply_config_preset(config: ModelConfig, preset_name: str) -> ModelConfig:
+    """Apply a configuration preset to a ModelConfig object"""
+    if preset_name not in CONFIG_PRESETS:
+        raise ValueError(f"Unknown config preset: {preset_name}. Available: {list(CONFIG_PRESETS.keys())}")
+
+    preset = CONFIG_PRESETS[preset_name]
+    print(f"\n📋 Applying config preset: '{preset_name}'")
+    print(f"   {preset['description']}")
+
+    for key, value in preset.items():
+        if key != 'description' and hasattr(config, key):
+            setattr(config, key, value)
+            print(f"   {key}: {value}")
+
+    return config
 
 # =============================================================================
 # GRANITE NANO MODEL WRAPPER
@@ -313,14 +379,16 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark DynamicHybridModel vs Granite Nano')
     parser.add_argument('--model', choices=['dynamic', 'granite', 'both'], default='both',
                        help='Which model to benchmark')
+    parser.add_argument('--config', type=str, choices=list(CONFIG_PRESETS.keys()),
+                       help=f'Use a predefined config preset: {", ".join(CONFIG_PRESETS.keys())}')
     parser.add_argument('--granite-path', type=str, default='~/models/granite-350m/',
                        help='Path to Granite Nano model')
     parser.add_argument('--device', type=str, default='cuda',
                        choices=['cuda', 'cpu'], help='Device to use')
-    parser.add_argument('--batch-size', type=int, default=8,
-                       help='Batch size for benchmarking')
-    parser.add_argument('--seq-length', type=int, default=1024,
-                       help='Sequence length for benchmarking')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Batch size for benchmarking (overrides config preset)')
+    parser.add_argument('--seq-length', type=int, default=None,
+                       help='Sequence length for benchmarking (overrides config preset)')
     parser.add_argument('--memory-scaling', action='store_true',
                        help='Run memory scaling benchmark')
     parser.add_argument('--output', type=str, default='benchmark_results.json',
@@ -330,8 +398,24 @@ def main():
 
     # Configure DynamicHybridModel
     config = ModelConfig()
-    config.batch_size = args.batch_size
-    config.max_seq_len = args.seq_length
+
+    # Apply config preset if specified
+    if args.config:
+        config = apply_config_preset(config, args.config)
+
+    # Override with command-line arguments if provided
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+        print(f"   Overriding batch_size: {args.batch_size}")
+    elif args.config is None:
+        config.batch_size = 8  # Default if no config preset
+
+    if args.seq_length is not None:
+        config.max_seq_len = args.seq_length
+        print(f"   Overriding max_seq_len: {args.seq_length}")
+    elif args.config is None:
+        config.max_seq_len = 1024  # Default if no config preset
+
     config.gradient_checkpointing = False  # Disable for benchmarking
     config.mixed_precision = (args.device == 'cuda')
 
